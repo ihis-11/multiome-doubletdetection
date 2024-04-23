@@ -1,0 +1,689 @@
+---
+title: "Integrated Doublet Cell Detection in Single-Cell Multiome (scRNA-seq & scATAC-seq)"
+author: "Hervé Ishimwe"
+output:
+  html_document:
+    theme: spacelab
+    df_print: kable
+    toc: true
+    toc_float: 
+      collapsed: true
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+all_times <- list()  # store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now)
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  eval = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  error = FALSE,
+  cache.lazy = FALSE,
+  time_it = TRUE
+)
+```
+
+This vignette introduces the voting approach for integrated doublet cell detection in single-cell multiome. It is divided into three main sections:
+
+1. `Seurat` workflow which consists of:
+  - RNA and ATAC preprocessing and dimension reductions
+  - Multimodal clustering following: [\textcolor{blue}{Weighted Nearest Neighbor Analysis of 10x multiome} data](https://satijalab.org/seurat/articles/weighted_nearest_neighbor_analysis#wnn-analysis-of-10x-multiome-rna-atac)
+  - Cell type annotation of the dataset following: [\textcolor{blue}{Multimodal reference mapping Vignette}](https://satijalab.org/seurat/articles/multimodal_reference_mapping.html)
+
+2. Running the doublet cell detection tools for each profile:
+  - `scATAC-seq` profile: we run the `ArchR` following the [\textcolor{blue}{ArchR tutorial}](https://www.archrproject.com/articles/Articles/tutorial.html)
+  - `scRNA-seq` profile: we run two doublet cell detection tools, 
+    + `DoubletFinder` following [\textcolor{blue}{DoubletFinder's example code for 'real-world' applications}](https://github.com/chris-mcginnis-ucsf/DoubletFinder?tab=readme-ov-file)
+    + `scDblFinder` following [\textcolor{blue}{scDblFinder tutorial}](https://bioconductor.org/packages/release/bioc/vignettes/scDblFinder/inst/doc/scDblFinder.html)
+
+3. Aggregating doublet scores and labels and the voting algorithm that incorporates the doublet scores and labels from the doublet cell detection tools as well as clustering information and cell type annotation predictions from the `Seurat` workflow.
+
+We first install the required libraries to run this vignette:
+
+```{r packages, cache=FALSE} 
+library(Seurat)
+library(SeuratDisk)
+library(Signac)
+library(EnsDb.Hsapiens.v86)
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(DoubletFinder)
+library(patchwork)
+library(dplyr)
+library(scDblFinder)
+library(ArchR)
+ArchR::installExtraPackages()
+```
+
+In this vignette, we use a sample from a `OP Multiome`, 10X Multiome human bone marrow dataset from Open Problems with `scRNA-seq` and `scATAC-seq`. Datasets similar to `10x Genomics's Multiome` can follow a similar format. The sample has 4176 cells. 
+
+## Seurat Workflow
+
+We first extract create the seurat object and 
+
+```{r seurat, cache=FALSE}
+working_directory <- paste("~/Desktop/Thesis/OP_Multiome/samples/DU19-01S0003363_7/")
+setwd(working_directory)
+
+sample_matrix <- Read10X_h5("filtered_feature_bc_matrix.h5") 
+frag_file <- "atac_fragments.tsv.gz"
+
+# creating the seurat object
+
+# extracting RNA counts
+seurat_object <- CreateSeuratObject(counts = sample_matrix$`Gene Expression`)
+seurat_object[["percent.mt"]] <- PercentageFeatureSet(seurat_object, pattern = "^MT-")
+
+# extracting ATAC counts
+atac_counts <- sample_matrix$Peaks
+grange.counts <- StringToGRanges(rownames(atac_counts), sep = c(":", "-"))
+grange.use <- seqnames(grange.counts) %in% standardChromosomes(grange.counts)
+atac_counts <- atac_counts[as.vector(grange.use), ]
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+seqlevelsStyle(annotations) <- 'UCSC'
+genome(annotations) <- "hg38"
+chrom_assay <- CreateChromatinAssay(
+  counts = atac_counts,
+  sep = c(":", "-"),
+  genome = 'hg38',
+  fragments = frag_file,
+  min.cells = 10,
+  annotation = annotations
+)
+seurat_object[["ATAC"]] <- chrom_assay
+
+seurat_object <- NormalizeData(seurat_object, verbose = FALSE)
+seurat_object <- ScaleData(seurat_object, features = rownames(seurat_object), 
+                           verbose = FALSE)
+seurat_object
+```
+
+### Preprocessing & dimension reduction
+
+Here we perform assay specific dimension reduction: `PCA` for `scRNA-seq` data and `LSI` for `scATAC-seq` data.
+
+```{r pca}
+dimensions <- list("dims_pca" = 1:30, "dims_lsi" = 2:30)
+DefaultAssay(seurat_object) <- "RNA"
+seurat_object <- SCTransform(seurat_object) %>% RunPCA(seurat_object)
+seurat_object <- RunUMAP(seurat_object, dims = dimensions$dims_pca, 
+                         reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_', 
+                         verbose = FALSE)
+```
+
+```{r lsi}
+DefaultAssay(seurat_object) <- "ATAC"
+seurat_object <- RunTFIDF(seurat_object)
+seurat_object <- FindTopFeatures(seurat_object, min.cutoff = 'q0')
+seurat_object <- RunSVD(seurat_object)
+seurat_object <- RunUMAP(seurat_object, reduction = 'lsi', dims = dimensions$dims_lsi, 
+                         reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+```
+
+###  Multimodal clustering
+
+We rely on `Seurat`'s multi-modal clustering which incorporates the information from both profiles to form the clusters.
+
+```{r clusters}
+seurat_object <- FindMultiModalNeighbors(seurat_object, 
+                                         reduction.list = list("pca", "lsi"), 
+                                         dims.list = dimensions, verbose = FALSE)
+seurat_object <- RunUMAP(seurat_object, nn.name = "weighted.nn", 
+                         reduction.name = "wnn.umap", 
+                         reduction.key = "wnnUMAP_", verbose = FALSE)
+seurat_object <- FindClusters(seurat_object, graph.name = "wsnn", algorithm = 3, 
+                              verbose = FALSE)
+```
+
+We visualize the clusters on the [\textcolor{blue}{UMAP}](https://arxiv.org/pdf/1802.03426.pdf?source=post_page) one for each profile (RNA and ATAC) and another for the weighted nearest neighbor which is a multimodal representation.
+
+```{r clusterplots, fig.width=20}
+cluster_plot_wnn <- DimPlot(seurat_object, reduction = "wnn.umap", 
+                            group.by = "seurat_clusters", label = TRUE, 
+                            label.size = 3, repel = TRUE) + ggtitle("WNN")
+cluster_plot_rna <- DimPlot(seurat_object, reduction = "umap.rna", 
+                            group.by = "seurat_clusters", label = TRUE, 
+                            label.size = 3, repel = TRUE) + ggtitle("RNA")
+cluster_plot_atac <- DimPlot(seurat_object, reduction = "umap.atac", 
+                             group.by = "seurat_clusters", label = TRUE, 
+                             label.size = 3, repel = TRUE) + ggtitle("ATAC")
+
+cluster_plot_rna + cluster_plot_atac + cluster_plot_wnn & NoLegend()
+```
+
+### Cell Type Annotation 
+
+We use `Seurat` mapping and annotating functions to predict the cell types using a reference dataset from the following paper: [\textcolor{blue}{(Hao, Hao et al, Cell 2021)}](https://www.sciencedirect.com/science/article/pii/S0092867421005833?via%3Dihub) 
+
+```{r loadReference}
+reference <- LoadH5Seurat("~/Desktop/Thesis/data/pbmc_multimodal.h5seurat")
+```
+
+Since we have gene expression information, we can follow this [\textcolor{blue}{Multimodal reference mapping Vignette}](https://satijalab.org/seurat/articles/multimodal_reference_mapping.html) to identify anchors and map them on our dataset for cell type annotation.
+
+```{r annotation}
+DefaultAssay(seurat_object) <- "RNA"
+anchors <- FindTransferAnchors(
+  reference = reference,
+  query = seurat_object,
+  normalization.method = "SCT",
+  reference.reduction = "spca",
+  dims = dimensions$dims_pca
+)
+
+seurat_object <- MapQuery(
+  anchorset = anchors,
+  query = seurat_object,
+  reference = reference,
+  refdata = list(
+    celltype.l1 = "celltype.l1", ## levels of accuracy
+    celltype.l2 = "celltype.l2",
+    celltype.l3 = "celltype.l3",
+    predicted_ADT = "ADT"
+  ),
+  reference.reduction = "spca",
+  reduction.model = "wnn.umap"
+)
+
+```
+
+```{r annotationplots, fig.width=20}
+l1_plot <- DimPlot(seurat_object, reduction = "wnn.umap", 
+                   group.by = "predicted.celltype.l1", label = TRUE, 
+                   label.size = 5, repel = TRUE) 
+l1_plot <- l1_plot + ggtitle('Cell Type - Level 1')
+
+l2_plot <- DimPlot(seurat_object, reduction = "wnn.umap", 
+                   group.by = "predicted.celltype.l2", label = TRUE, 
+                   label.size = 5, repel = TRUE)
+l2_plot <- l2_plot + ggtitle("Cell Type - Level 2")
+
+l3_plot <- DimPlot(seurat_object, reduction = "wnn.umap", 
+                   group.by = "predicted.celltype.l3", label = TRUE, 
+                   label.size = 5, repel = TRUE)
+l3_plot <- l3_plot + ggtitle("Cell Type - Level 3")
+
+l1_plot + l2_plot + l3_plot & NoLegend()
+```
+
+## Doublet Cell Detection Tools 
+
+### ArchR 
+
+Here we follow the [\textcolor{blue}{brief ArchR tutorial}](https://www.archrproject.com/articles/Articles/tutorial.html) to create `ArrowFiles` from the fragments file then generate doublet scores on the cells identified followed by the creation of the `ArchRProject`.
+
+```{r archRscores, results='hide'}
+setwd(working_directory)
+
+set.seed(1)
+addArchRThreads(threads = 16) 
+addArchRGenome("hg38")
+
+ArrowFiles <- createArrowFiles(
+  inputFiles = frag_file,
+  sampleNames = "pbmc",
+  addTileMat = TRUE,
+  addGeneScoreMat = TRUE
+)
+
+doubletScores <- addDoubletScores( 
+  input = ArrowFiles
+)
+
+sample_archRProject <- ArchRProject(
+  ArrowFiles = ArrowFiles,
+  copyArrows = TRUE
+)
+```
+
+Since `ArchR` doesn't have generate labels to indicate which cells classified as doublets and which are not, we rely on the functionality of the `ArchR` function [\textcolor{blue}{filterDoublets}](https://www.archrproject.com/reference/filterDoublets.html) which has an argument, `filterRatio`, that determines the ratio of doublets to filter out. Then using the default value `filterRatio = 1`, we estimated the number of doublets identified using the following formula $$\frac{filterRatio * (number \space of \space cells)^2}{10000}$$ From this, we label the cells with the lowest [\textcolor{blue}{doublet enrichment}](https://www.archrproject.com/bookdown/inferring-scatac-seq-doublets-with-archr.html) generated from the function `addDoubletScores` as doublets (which corresponds to the number of doublets computed earlier) and the rest as singlets.
+
+```{r archRLabels}
+archR_scores <- doubletScores[[1]]@listData[["doubletScore"]]
+doublet_enrich <- doubletScores[[1]]@listData[["doubletEnrich"]]
+
+## formatting cell ids 
+extracted_cell_ids <- names(archR_scores)
+archR_cell_ids <- c()
+for (id in extracted_cell_ids) {
+  archR_cell_ids <- c(archR_cell_ids, unlist(strsplit(id, split='#', fixed=TRUE))[2])
+}
+
+archR_results <- data.frame(
+  cell_id = archR_cell_ids,
+  archR_score = unname(archR_scores),
+  archR_enrich = unname(doublet_enrich)
+)
+
+## labeling the cells using the filtering mechanism of archR (filter ratio = 1)
+archR_cell_count <- length(archR_scores)
+archR_doublet_count <- round(archR_cell_count ^ 2 / 100000) 
+archR_singlet_count <- archR_cell_count - archR_doublet_count
+
+# sort the cells in increasing order then remove the highest ones (doublets)
+archR_results <- arrange(archR_results, archR_enrich)
+archR_labels <- vector(mode="character", length = archR_cell_count)
+archR_labels <- factor(archR_labels, levels = c('singlet', 'doublet'))
+archR_results$archR_label <- archR_labels
+
+## setting the labels 
+archR_results$archR_label[1:archR_singlet_count] <- 'singlet'
+archR_results$archR_label[(archR_singlet_count + 1): length(archR_scores)] <- 'doublet'
+```
+
+In order to generate a visualization similar to those in `Seurat`, we create a new `Seurat` object from the `GeneScoreMatrix` as follow:
+
+```{r archRSeurat}
+geneScoreMatrix <- ArchR::getMatrixFromProject(sample_archRProject, 
+                                               useMatrix='GeneScoreMatrix')
+rownames(geneScoreMatrix) <-getFeatures(sample_archRProject, 
+                                        useMatrix = "GeneScoreMatrix", 
+                                        select = NULL,ignoreCase = TRUE)
+
+archR_sce <- as(geneScoreMatrix, "SingleCellExperiment")
+archR_sce@assays@data@listData$logcounts<-archR_sce@assays@data@listData$GeneScoreMatrix
+
+archR_seurat <- as.Seurat(sce, counts="GeneScoreMatrix")
+
+## LSI dimension reduction (ATAC)
+archR_seurat <- RunTFIDF(archR_seurat)
+archR_seurat <- FindTopFeatures(archR_seurat, min.cutoff = 'q0')
+archR_seurat <- RunSVD(archR_seurat)
+archR_seurat <- RunUMAP(archR_seurat, reduction = 'lsi', dims = dimensions$dims_lsi, 
+                        reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+```
+
+```{r archRLabelMatching}
+## making sure we match the label to the right cell
+extracted_names <- names(archR_seurat@active.ident)
+geneScore_names <- c()
+for (name in extracted_names) {
+  geneScore_names <- c(geneScore_names, unlist(strsplit(name, split='#', 
+                                                        fixed=TRUE))[2])
+}
+
+geneScore_details = data.frame(
+  cell_id = geneScore_names
+)
+
+geneScore_details <- merge(geneScore_details, archR_results , by ="cell_id", sort = FALSE)
+```
+
+```{r archRPlots}
+feature_color <- scale_colour_gradientn(colours = rev(brewer.pal(n = 3, name = "RdBu")))
+
+archR_feature_plot <- FeaturePlot(archR_seurat, reduction = "umap.atac", 
+                                  features = "DoubletScore")
+archR_feature_plot <- archR_feature_plot + feature_color
+archR_feature_plot <- archR_feature_plot + ggtitle("ArchR - scores")
+
+archR_doublets_plot <- DimPlot(archR_seurat, reduction = "umap.atac", 
+                               group.by = "archR.labels", label = FALSE, repel = TRUE) 
+archR_doublets_plot <- archR_doublets_plot + ggtitle("ArchR - Labels")
+archR_feature_plot
+archR_doublets_plot
+```
+
+### scDblFinder
+
+Here we generate doublet scores and labels for the cells processed in the `seurat` object. We use the random mode for the generation of artificial doublets.
+
+```{r scdblFinder}
+sample_sce <- as.SingleCellExperiment(seurat_object)
+scdbl_random <- scDblFinder(sample_sce)
+
+seurat_object$scdbl.scores <- scdbl_random$scDblFinder.score
+seurat_object$scdbl.labels <- scdbl_random$scDblFinder.class
+```
+
+```{r scdblPlots}
+scdbl_feature_plot <- FeaturePlot(seurat_object, reduction = "wnn.umap", 
+                                  features = "scdbl.scores")
+scdbl_feature_plot <- scdbl_feature_plot + feature_color
+scdbl_feature_plot <- scdbl_feature_plot + ggtitle("scDblFinder - scores")
+
+scdbl_doublets_plot <- DimPlot(seurat_object, reduction = "wnn.umap", 
+                            group.by = "scdbl.labels", label = FALSE, repel = TRUE) 
+scdbl_doublets_plot <- scdbl_doublets_plot + ggtitle("scDblFinder - Labels")
+
+scdbl_feature_plot + scdbl_doublets_plot 
+```
+
+### DoubletFinder 
+
+```{r paramSweep, results='hide'}
+sweep.res <- paramSweep_v3(seurat_object, PCs = 1:50, sct = TRUE)
+sweep.stats <- summarizeSweep(sweep.res, GT = FALSE)
+bcmv <- find.pK(sweep.stats)
+pK.set <- unique(sweep.stats$pK)[2]
+```
+
+For the estimated number of doublets, we use the estimated doublet cell percentages for `10x Multiome` dataset from this [\textcolor{blue}{source}](https://uofuhealth.utah.edu/huntsman/shared-resources/gcb/htg/single-cell/genomics-10x)
+
+```{r doubletFinder}
+doublet_percent_estimate <- 0.078
+nExp_poi <- round(doublet_percent_estimate*nrow(seurat_object@meta.data)) 
+seurat_object <- doubletFinder_v3(seurat_object, PCs = 1:50, 
+                                  pK = as.numeric(as.character(pK.set)), 
+                                  nExp = nExp_poi, sct = TRUE)
+```
+
+```{r doubletFinderplots, fig.width = 20}
+df_feature_plot <- FeaturePlot(seurat_object, reduction = "wnn.umap", 
+                               features = "pANN_0.25_0.005_929")
+df_feature_plot <- df_feature_plot + feature_color
+df_feature_plot <- df_feature_plot + ggtitle("DoubletFinder - scores")
+
+df_doublets_plot <- DimPlot(seurat_object, reduction = "wnn.umap", 
+                            group.by = "DF.classifications_0.25_0.005_929", 
+                            label = FALSE, repel = TRUE) 
+df_doublets_plot <- df_doublets_plot + ggtitle("DoubletFinder - Labels")
+
+df_feature_plot + df_doublets_plot 
+```
+
+## The Voting algorithm
+
+The voting algorithm relies on three keystones:
+
+* the doublet scores and labels generated by `ArchR`, `scDblFinder`, and `DoubletFinder`
+* cell clusters
+* cell type annotation
+
+### Selecting Cell Type Annotation Level 
+
+Before aggregating all the doublet scores and labels, we want to know which annotation level to use. 
+
+For each annotation level of granularity, we have prediction scores which are on a scale from `0` to `1` where a higher score corresponds to the level of confidence of the cell type annotation. We want to select a robust annotation level which has the highest mean (skewed towards 1) and a small standard deviation.
+
+```{r annotLevel, fig.width = 20, echo=FALSE}
+annotation_stats <- data.frame(
+  "granularity level" = c("1", "2", "3"),
+  "mean" = c(mean(seurat_object@meta.data$predicted.celltype.l1.score), 
+             mean(seurat_object@meta.data$predicted.celltype.l2.score), 
+             mean(seurat_object@meta.data$predicted.celltype.l3.score)),
+  "standard_deviation" = c(sd(seurat_object@meta.data$predicted.celltype.l1.score), 
+                           sd(seurat_object@meta.data$predicted.celltype.l2.score), 
+                           sd(seurat_object@meta.data$predicted.celltype.l3.score)) 
+)
+annotation_stats
+```
+After observing the means and standard deviations of all annotation levels, we select the annotation level 1. 
+
+### Aggregating information together
+
+Then we start extracting the cluster ids, prediction scores, and doublet scores and labels from the `seurat` object, `DoubletFinder` and `scDblFinder` results first because they have the same number of processed cells.
+
+```{r integration}
+all_scores <- data.frame(
+  cell_id = c(names(seurat_object@active.ident)),
+  cluster_id = c(seurat_object@meta.data$seurat_clusters),
+  l1_annotation_score = c(seurat_object@meta.data$predicted.celltype.l1.score),
+  doubletFinder_score = c(seurat_object@meta.data$pANN_0.25_0.005_929),
+  doubletFinder_label = c(seurat_object@meta.data$DF.classifications_0.25_0.005_929),
+  scDbl_score = c(scdbl_random$scDblFinder.score),
+  scDbl_label = c(scdbl_random$scDblFinder.class)
+)
+
+all_scores$doubletFinder_label <- tolower(all_scores$doubletFinder_label)
+```
+
+Then we merged this information with the scores and labels generated by `archR`. The cell counts for both objects might not match since it is possible that for one cell, the gene expression count meet `seurat` standards while its open chromatin levels don't meet `ArchR` standards and vice versa. Therefore, we anticipate cell filtering from both directions. 
+
+```{r merging}
+all_scores <- merge(all_scores, archR_results, by = "cell_id")
+```
+
+### Counting votes
+
+Now that we have all the scores together, we can start gathering the votes.
+
+#### Doublet Detection Tools 
+
+1. For each cell, we count the number of doublet cell detection tools (`ArchR`, `scDblFinder`, `DoubletFinder`) that classified it as a doublet. This helps in the identification of cells  which are candidate for doublet cell consideration i.e cells which were classified as doublet by at least one doublet detection tool. We identify such cells for each cluster. 
+
+```{r toolVoting}
+cell_count <- length(all_scores$cell_id)
+  
+all_scores$tools_vote <- vector(mode="integer", length=cell_count)
+
+cluster_ids <- levels(seurat_object@meta.data[["seurat_clusters"]])
+
+## for keep track of the stats per cell cluster
+cluster_info <- data.frame(
+  "cluster_id" = cluster_ids,
+  "cluster_count" = vector(mode="integer", length = length(cluster_ids)),
+  "dblt_candidates" = vector(mode="numeric", length = length(cluster_ids))
+)
+
+for (id in cluster_ids) {
+  cluster_cells <- all_scores %>% filter(all_scores$cluster_id == id)
+  cluster_count <- length(cluster_cells$cell_id)
+  cluster_info[cluster_info$cluster_id == id, "cluster_count"] <- cluster_count
+
+  dblt_candidates <- 0
+  
+  for (cell in cluster_cells$cell_id) {
+    cell_info <- cluster_cells[cluster_cells$cell_id == cell,]
+    
+    tools_vote <- 0
+    
+    if (cell_info$doubletFinder_label == 'doublet') {
+      tools_vote <- tools_vote + 1
+    }
+    
+    if (cell_info$scDbl_label == 'doublet') {
+      tools_vote <- tools_vote + 1
+    }
+    
+    if (cell_info$archR_label == 'doublet') {
+      tools_vote <- tools_vote + 1
+    }
+    
+    all_scores[all_scores$cell_id == cell, "tools_vote"] <- tools_vote
+    
+    if(tools_vote >= 1) {
+      dblt_candidates <- dblt_candidates + 1
+    }
+  }
+  
+  cluster_info[cluster_info$cluster_id == id, "dblt_candidates"] <- dblt_candidates
+}
+```
+
+#### Cell Type Annotation
+
+2. Now that we know which the number of cells that are candidates for doublet classification, we can incorporate a vote from the cell type annotation using the prediction score. 
+
+Our assumption is that the doublet cells especially heterotypic doublet cells will be annotated with the lowest prediction scores. Therefore, for each cluster, we select the cells with the lowest prediction scores for the cell type annotation vote. The number of cells selected corresponds to the number of cell candidates by cell cluster computed in the previous step. 
+
+```{r annotationVote}
+all_scores$tools_annot_vote <- vector(mode="integer", length=cell_count)
+
+for (id in cluster_ids) {
+  cluster_cells <- all_scores %>% filter(all_scores$cluster_id == id)
+  
+  ## arrange the cells by l1 prediction scores in ascending order
+  cluster_cells <- arrange(cluster_cells, l1_annotation_score)
+  
+  dblt_candidates <- cluster_info[cluster_info$cluster_id == id, "dblt_candidates"]
+  cluster_count <- cluster_info[cluster_info$cluster_id == id, "cluster_count"]
+  
+  for (index in 1:cluster_count) {
+    cell_id <- cluster_cells$cell_id[index]
+    tools_vote <- all_scores[all_scores$cell_id == cell_id, "tools_vote"] 
+    
+    ## cells with the lowest prediction scores, the total vote increments
+    if (index < dblt_candidates + 1) {
+      all_scores[all_scores$cell_id == cell_id, "tools_annot_vote"] <- tools_vote + 1
+    } else {
+      all_scores[all_scores$cell_id == cell_id, "tools_annot_vote"] <- tools_vote
+    }
+  }
+}
+
+cluster_info <- subset(cluster_info, select=-dblt_candidates)
+```
+
+#### Cluster Classification & Final Classification
+
+3. For each cell, we have four votes: 3 coming from the doublet cell detection tools and 1 from the cell type annotation. Now we can classify the cell as a doublet or singlet based on this vote. Our assumption here is that if a cell has at least two votes, that means that it is likely to be a doublet cell. 
+
+Before we do the final classification, we classify the cell clusters as either clusters of doublet cells or not. This is based on the idea that doublet cells form their own clusters. For this classification, we first compute the percentage of cells that have 2 or more votes per cluster (cells which will were classified by two tools or a tool and annotation as doublets). Then, we compute a fold change of this percentage and the average doublet percentage from the 3 doublet detection tools. If the fold change is greater or equal to 2 then all cells in that given cluster is classified as doublets. 
+
+* We first compute the average doublet percentage from the doublet detection tools.
+
+```{r doubletPercentages}
+doubletFinder_dbt <- all_scores %>% filter(all_scores$doubletFinder_label == 'doublet')
+scDblRandom_dbt <- all_scores %>% filter(all_scores$scDbl_label == 'doublet')
+archR_dbt <- all_scores %>% filter(all_scores$archR_label == 'doublet')
+
+dbt_percentages <- c(length(doubletFinder_dbt$cell_id), length(scDblRandom_dbt$cell_id), 
+                     length(archR_dbt$cell_id))
+dbt_percentages <- dbt_percentages * 100 / cell_count
+
+average_dbt_percent <- mean(dbt_percentages)
+average_dbt_percent
+```
+
+* Then we compute per cluster the percentage of cells that have more than 2 votes and the fold change with average doublet percentage for the dataset.
+
+```{r foldChange}
+cluster_info$doublet_percentage <- vector(mode="integer", length = length(cluster_ids))
+cluster_info$fold_change <- vector(mode="integer", length = length(cluster_ids))
+
+cluster_labels <- vector(mode="character", length= length(cluster_ids))
+cluster_labels <- factor(cluster_labels, levels=c('singlet', 'doublet'))
+cluster_info$cluster_label <- cluster_labels
+
+for (id in cluster_ids) {
+  cluster_cells <- all_scores %>% filter(all_scores$cluster_id == id)
+  
+  tools_annotation_count <- 0 
+  
+  for (cell in cluster_cells$cell_id) {
+    tools_annot_vote <- all_scores[all_scores$cell_id == cell, "tools_annot_vote"]
+    
+    if (tools_annot_vote >= 2) {
+      tools_annotation_count <- tools_annotation_count + 1
+    } 
+  }
+  
+  cluster_count <- cluster_info[cluster_info$cluster_id == id, "cluster_count"] 
+  doublet_percentage <- tools_annotation_count * 100 / cluster_count
+  cluster_info[cluster_info$cluster_id == id, "doublet_percentage"] <- doublet_percentage
+  
+  fold_change <- doublet_percentage / average_dbt_percent
+  cluster_info[cluster_info$cluster_id == id, "fold_change"] <- fold_change
+  
+  ## meaning that this cluster has a two or more fold change compared to the dataset
+  if (fold_change >= 2.0) {
+    cluster_info[cluster_info$cluster_id == id, "cluster_label"] <- 'doublet'
+  } else {
+    cluster_info[cluster_info$cluster_id == id, "cluster_label"] <- 'singlet'
+  }
+}
+```
+
+```{r clusterInfo, echo=FALSE}
+View(cluster_info)
+```
+
+* Now, we can make the final classification for each cell as follows:
+
+```{r finalLabel}
+final_labels <- vector(mode="character", length= cell_count)
+final_labels <- factor(final_labels, levels=c('singlet', 'doublet'))
+all_scores$final_label <- final_labels
+
+for (id in cluster_ids) {
+  cluster_label <- cluster_info[cluster_info$cluster_id == id, "cluster_label"]
+  
+  cluster_cells <- all_scores %>% filter(all_scores$cluster_id == id)
+  
+  for (cell in cluster_cells$cell_id) {
+    cell_info <- cluster_cells[cluster_cells$cell_id == cell,]
+    
+    if (cluster_label == 'doublet' || cell_info$tools_annot_vote >= 2) {
+      all_scores[all_scores$cell_id == cell, "final_label"] <- 'doublet'
+    } else {
+      all_scores[all_scores$cell_id == cell, "final_label"] <- 'singlet'
+    }
+  }
+}
+```
+
+
+```{r finalDoubletPercentage}
+final_doublets <- all_scores %>% filter(all_scores$final_label == 'doublet')
+final_doublet_percentage <- length(final_doublets$cell_id) * 100 / cell_count
+final_doublet_percentage
+```
+
+We can visualize these classifications based on the voting algorithm. Since there was filtering, some of the recovered cells in the `Seurat` object will not have a final label, so we label them as `unclassified`.
+
+```{r votesPlot}
+## recovering the order of cell ids in Seurat object
+seurat_vote_labels <- data.frame(
+  cell_id = c(names(seurat_object@active.ident))
+)
+
+vote_label <- vector(mode="character", length= length(final_plotting$cell_id))
+vote_label <- factor(vote_label, levels=c('singlet', 'doublet', 'unclassified'))
+seurat_vote_labels$vote_label <- vote_label
+
+seurat_vote_labels <- merge(seurat_vote_labels, all_scores, by = "cell_id", all.x = TRUE, sort = FALSE)
+
+for (cell in seurat_vote_labels$cell_id) {
+  cell_info <- seurat_vote_labels[seurat_vote_labels$cell_id == cell, ]
+  
+  if (is.na(cell_info$final_label)) {
+    merged_final[merged_final$cell_id == cell, "vote_label"] <- 'unclassified'
+  } else {
+    if(cell_info$final_label == 'doublet') {
+      seurat_vote_labels[seurat_vote_labels$cell_id == cell, "vote_label"] <- 'doublet'
+    } else if (cell_info$final_label == 'singlet') {
+      seurat_vote_labels[seurat_vote_labels$cell_id == cell, "vote_label"] <- 'singlet'
+    }
+  }
+}
+
+seurat_object$vote.label <- seurat_vote_labels$vote_label
+
+final_doublets_plot <- DimPlot(seurat_object, reduction = "wnn.umap", group.by = "vote.label", label = FALSE, repel = TRUE) 
+final_doublets_plot <- final_doublets_plot + ggtitle("Voting Algorithm - Labels")
+final_doublets_plot
+```
+
+```{r classificationStats}
+singlet <- seurat_vote_labels %>% filter(seurat_vote_labels$vote_label == 'singlet')
+doublet <- seurat_vote_labels %>% filter(seurat_vote_labels$vote_label == 'doublet')
+unclassified <- seurat_vote_labels %>% filter(seurat_vote_labels$vote_label == 'unclassified')
+
+percentages <- data.frame(
+  label = c('singlet', 'doublet', 'unclassified'),
+  percentage = c(length(singlet$cell_id), length(doublet$cell_id), length(unclassified$cell_id))
+)
+percentages$percentage <- percentages$percentage * 100 / length(seurat_vote_labels$cell_id)
+
+percentages
+```
+
+<details>
+  <summary>**Session Info**</summary>
+```{r}
+sessionInfo()
+```
+</details>
